@@ -32,5 +32,13 @@ The application runs on port 8080 and exposes metrics on port 8081
    - `kubectl apply -f k8s/db-secret.yaml`
    - `kubectl apply -f k8s/db-config.yaml`
    - `kubectl create secret docker-registry my-registry-key --docker-server=docker.io --docker-username=monikajassova --docker-password=<pwd>`
-    - `kubectl apply -f k8s/java-app.yaml`
+   - `kubectl apply -f k8s/java-app.yaml`
    - `kubectl apply -f k8s/ingress.yaml`
+
+   Verified the deployment end-to-end:
+
+   - `kubectl get deploy java-app-deployment` → `3/3 READY`, `3 UP-TO-DATE`, `3 AVAILABLE`
+   - `kubectl get pods -l app=java-app` → 3 pods `1/1 Running`, 0 restarts
+   - `kubectl get endpoints java-app-service` → 3 endpoint IPs (one per replica)
+   - `curl -s http://80.158.5.59/get-data` → HTTP 200 with live data from MySQL
+   - `kubectl logs -n ingress deploy/ingress-ingress-nginx-controller` → requests from the ingress load balancer across all 3 pod IPs (`172.16.0.21`, `172.16.0.39`, `172.16.0.51`)
