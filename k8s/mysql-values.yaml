@@ -1,0 +1,8 @@
+metrics:
+  enabled: true
+  image:
+    repository: bitnamilegacy/mysqld-exporter
+  serviceMonitor:
+    enabled: true
+    labels:
+      release: monitoring
