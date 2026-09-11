@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: db-config
+data:
+  # Bitnami chart primary service: <release>-primary.<namespace>
+  db_server: mysql-release-primary.default
