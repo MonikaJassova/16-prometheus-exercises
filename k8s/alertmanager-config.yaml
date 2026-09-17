@@ -1,0 +1,63 @@
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: AlertmanagerConfig
+metadata:
+  name: app-notifications
+  namespace: monitoring
+spec:
+  route:
+    # Catch-all: anything not matched by a child route goes to email, so no
+    # alert is ever silently dropped.
+    receiver: email
+    groupBy: ['alertname']
+    groupWait: 30s
+    groupInterval: 5m
+    repeatInterval: 4h
+    routes:
+      # Java / MySQL -> dev team chat (Rocket.Chat #dev-alerts)
+      - matchers:
+          - name: app
+            value: "java-app|mysql"
+            matchType: "=~"
+        receiver: rocketchat
+        repeatInterval: 1h
+      # Nginx Ingress / K8s components -> K8s admin email
+      - matchers:
+          - name: app
+            value: "nginx-ingress|kubernetes"
+            matchType: "=~"
+        receiver: email
+        repeatInterval: 1h
+  receivers:
+    - name: rocketchat
+      rocketchatConfigs:
+        - sendResolved: true
+          # In-cluster Service (non-secret); the RC pod listens on 3000, the
+          # service exposes it as 80.
+          apiURL: "http://rocketchat-rocketchat.monitoring.svc:80"
+          channel: "#dev-alerts"
+          color: "#d9232d"
+          title: '{{ if eq .Status "firing" }}:rotating_light: FIRING: {{ else }}:white_check_mark: RESOLVED: {{ end }}{{ .CommonLabels.alertname }}'
+          # Block scalar: Go templates do not process \n escapes, so the template
+          # must contain real newlines to produce a multi-line message.
+          text: |-
+            {{ range .Alerts }}*{{ .Status }}* {{ .Labels.alertname }} ({{ .Labels.severity }})
+            {{ .Annotations.summary }}
+            {{ .Annotations.description }}
+            {{ end }}
+          token:
+            name: rocketchat-auth
+            key: token
+          tokenID:
+            name: rocketchat-auth
+            key: token_id
+    - name: email
+      emailConfigs:
+        - to: 'jassova.mon@gmail.com'
+          from: 'jassova.mon@gmail.com'
+          smarthost: 'smtp.gmail.com:587'
+          authUsername: 'jassova.mon@gmail.com'
+          authIdentity: 'jassova.mon@gmail.com'
+          authPassword:
+            name: gmail-auth
+            key: password
+          sendResolved: true
