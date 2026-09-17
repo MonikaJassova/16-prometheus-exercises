@@ -1,0 +1,11 @@
+# kube-prometheus-stack upgrade values (applied with --reuse-values)
+#
+# G1 fix: the default matcher strategy is OnNamespace, which makes the operator
+# inject a `namespace=<AlertmanagerConfig namespace>` matcher into the first
+# route. Our alerts (k8s/alert-rules.yaml) carry `app`/`severity` but no
+# `namespace` label, so every alert would be silently dropped and no
+# notification would ever fire. None = route all alerts, no namespace filter.
+alertmanager:
+  alertmanagerSpec:
+    alertmanagerConfigMatcherStrategy:
+      type: None

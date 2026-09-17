@@ -1,0 +1,59 @@
+# Rocket.Chat (chart: rocketchat, repo: https://rocketchat.github.io/helm-charts)
+# Single-namespace dev install in the `monitoring` namespace on the CCE eu-de cluster.
+
+# CRITICAL: the chart defaults microservices.enabled to true, which also deploys
+# NATS (2-node cluster + box + exporter) and 4 microservice pods (~10 pods total).
+# Set false for the intended 2-pod monolith (Rocket.Chat + MongoDB).
+microservices:
+  enabled: false
+
+# NATS subchart condition is "nats.enabled, microservices.enabled" and nats.enabled
+# defaults to nil (treated as enabled). Set it explicitly false so NATS never
+# renders, even if microservices is ever flipped back on.
+nats:
+  enabled: false
+
+# The chart ships no default requests/limits; the Node/Meteor process needs
+# explicit limits so it is not OOM-killed on the small CCE node.
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: "1"
+    memory: 2Gi
+
+# Headless bootstrap: the chart injects this secret via envFrom, so the ADMIN_*
+# env vars create the first admin user and the setup wizard is marked completed.
+# The whole setup (admin -> channel -> PAT) can then be API-driven, no browser.
+extraSecret: rocketchat-admin
+
+# Browser access is via kubectl port-forward (dev). The in-cluster Service is
+# what Alertmanager uses (http://rocketchat-rocketchat.monitoring.svc:80).
+service:
+  type: ClusterIP
+
+mongodb:
+  # Rocket.Chat 8.6.1 requires MongoDB >= 8.0; the chart (13.x) pins 6.0.10,
+  # which makes RC exit at startup ("MONGODB VERSION IS NOT SUPPORTED").
+  # Override the tag to a 8.0.x from the same bitnamilegacy repo.
+  image:
+    tag: "8.0.13"
+  # Single-instance replica set (chart default), 8Gi ReadWriteOne on the cluster
+  # default StorageClass (csi-disk).
+  architecture: replicaset
+  replicaCount: 1
+  persistence:
+    enabled: true
+    size: 8Gi
+    # The cluster has NO default StorageClass (existing PVCs are all on csi-disk),
+    # so an unset storageClassName leaves the PVC unbound (Pending) and the
+    # MongoDB pod stuck. Pin it to the cluster's block-storage class.
+    storageClass: csi-disk
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi

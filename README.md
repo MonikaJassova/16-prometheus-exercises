@@ -138,3 +138,60 @@ All three application metrics are collected (verified in the Prometheus targets 
    The ingress-nginx controller exposes `nginx_ingress_controller_nginx_process_requests_total` (total, no status label) for all traffic, but the per-status histogram used by the 4xx alert (`nginx_ingress_controller_requests{status=...}`) is only written for requests whose `Host` header matches a DNS host defined in an Ingress. A hostless catch-all ingress returns 200s for everything, yet the per-status metric stays empty — the 4xx alert is defined and correct but can never fire. Fix: add a DNS host rule (e.g. `host: java-app.local`) so the measurable traffic matches it; keep the hostless catch-all alongside it to preserve raw IP access. Verify with `curl -s -H "Host: java-app.local" http://<ELB-IP>/path-that-doesnt-exist` (a 404) and then query `nginx_ingress_controller_requests{host="java-app.local"}` — both `status="200"` and `status="404"` series appear.
 
    Note: `java-app.local` is not resolvable by any DNS — browser access to the host-scoped route only works after adding it locally (`echo "80.158.5.59 java-app.local" | sudo tee -a /etc/hosts`); without it, only `curl -H "Host: java-app.local"` works.
+
+## Sending Alert Notifications
+
+Instead of using Slack, a **self-hosted Rocket.Chat** was deployed to the cluster and used as the chat channel (native Alertmanager `rocketchatConfigs` receiver — the deployed Alertmanager is v0.34.0, so no webhook adapter is needed). Email reuses the existing Gmail configuration from the 16-prometheus project.
+
+1. Deployed Rocket.Chat with a single Helm chart (2-pod monolith: Rocket.Chat + MongoDB):
+    - `helm repo add rocketchat https://rocketchat.github.io/helm-charts` + `helm repo update`
+    - `mise exec -- helm install rocketchat rocketchat/rocketchat -n monitoring -f k8s/rocketchat-values.yaml --set "mongodb.auth.passwords[0]=<app-pass>" --set "mongodb.auth.rootPassword=<root-pass>" --wait --timeout 15m`
+    - `k8s/rocketchat-values.yaml` — `microservices.enabled: false` **and** `nats.enabled: false` (see Gotcha 2 below), explicit resources (the chart ships none), `extraSecret: rocketchat-admin` for headless first boot (`ADMIN_USERNAME`/`ADMIN_EMAIL`/`ADMIN_PASS` env vars create the admin user and mark the setup wizard completed — the whole setup is then API-driven, no browser), `mongodb.image.tag: "8.0.13"` (RC 8.6.1 requires Mongo ≥ 8.0), `mongodb.persistence.storageClass: csi-disk`
+    - browser access is via `kubectl port-forward` (dev); Alertmanager talks to Rocket.Chat in-cluster at `http://rocketchat-rocketchat.monitoring.svc:80`
+
+    Verified: `mise exec -- kubectl -n monitoring get pods` → `rocketchat-rocketchat-*` 1/1 + `rocketchat-mongodb-0` 2/2, 0 restarts, **no NATS pods**; PVC `Bound` on `csi-disk`; port-forward → `/health` 200 and admin login `success`.
+
+1. Created the `#dev-alerts` channel and the Alertmanager credentials **via the Rocket.Chat API**: `POST /api/v1/login` → `POST /api/v1/channels.create` → `POST /api/v1/users.generatePersonalAccessToken`. The PAT + admin userId are stored in the `rocketchat-auth` Secret (keys `token`, `token_id`) — values live in the cluster only, never in the repo (`k8s/rocketchat-secret.yaml` is a placeholder). Verified with a test `POST /api/v1/chat.postMessage` using the PAT.
+
+1. For email, `k8s/email-secret.yaml` committed as the placeholder manifest; adjusted with actual value and applied.
+
+1. Created `k8s/alertmanager-config.yaml` (`AlertmanagerConfig` CRD in `monitoring`), routing on the `app` label the exercise alerts already carry:
+
+    | Route | Matchers | Receiver |
+    |-------|----------|----------|
+    | Java / MySQL | `app=~"java-app\|mysql"` | `rocketchat` → `#dev-alerts` |
+    | Nginx / K8s | `app=~"nginx-ingress\|kubernetes"` | `email` → Gmail (`smtp.gmail.com:587`, `gmail-auth` secret) |
+    | Catch-all | (no matchers) | `email` — unmatched alerts (e.g. the built-in kube rules) are never silently dropped |
+
+    Both receivers have `sendResolved: true`. The CRD matchers use the object form (`name`/`value`/`matchType: "=~"`), and OR is expressed as a single regex matcher with `|` (matchers in a list are AND-ed).
+
+1. Fixed the Alertmanager **matcher strategy** so alerts are not silently dropped: kube-prometheus-stack defaults to `OnNamespace`, which makes the operator inject a `namespace=<CR namespace>` matcher into the first route — the exercise alerts carry `app`/`severity` but no `namespace` label, so every alert would be filtered out with no error. Set `alertmanager.alertmanagerConfigMatcherStrategy.type: None` in `k8s/monitoring-values.yaml` and applied with a **version-pinned** upgrade:
+    - `helm upgrade monitoring prometheus-community/kube-prometheus-stack -n monitoring --version 90.0.0 -f k8s/monitoring-values.yaml --reuse-values --wait`
+    - `mise exec -- kubectl apply -f k8s/alertmanager-config.yaml`
+
+    Verified: `kubectl -n monitoring get alertmanagerconfig` → `app-notifications`; Alertmanager logs show "Completed loading of configuration file"; `/api/v2/status` on the Alertmanager service shows both receivers and both child routes in the generated config.
+
+1. Verified end-to-end (1 alert per channel):
+    - **Email**: a burst of host-scoped 404s (`curl -H "Host: java-app.local" http://80.158.5.59/path-that-doesnt-exist`) drove `NginxIngressHigh4xxRatio` to firing → **email arrived in the Gmail inbox**; 1200 clean 200s then diluted the ratio back under 5% and the alert resolved
+    - **Chat**: a ~15 req/s load for 4 min (`/get-data`) drove `JavaAppTooManyRequests` to firing → **message appeared in `#dev-alerts`** (title `🚨 FIRING: JavaAppTooManyRequests`, body with summary + description); the load decayed and the **RESOLVED** message followed
+    - routing split held: Java/MySQL alerts appear in the channel only, Nginx/K8s alerts in email only
+    - final state: all 5 exercise alerts `state: inactive`, `health: ok`; only the built-in `Watchdog` active in Alertmanager
+
+### Gotchas
+
+1. **The `OnNamespace` matcher strategy silently drops all configured alerts.** kube-prometheus-stack's default `alertmanagerConfigMatcherStrategy` is `OnNamespace`: the operator injects a `namespace=<AlertmanagerConfig namespace>` matcher into the first route, so an AlertmanagerConfig only routes alerts that carry that `namespace` label. Our alerts carry `app`/`severity` but no `namespace` → nothing is ever routed, and there is no error anywhere. Fix: `alertmanager.alertmanagerConfigMatcherStrategy.type: None` in the helm values (persistent across upgrades).
+
+2. **The Rocket.Chat chart deploys NATS even with `microservices.enabled: false`.** The values.yaml comment claiming "monolith RC without NATS" is stale: the nats subchart condition is `nats.enabled, microservices.enabled` and `nats.enabled` defaults to nil, which is treated as *enabled* — so 2 NATS pods + nats-box get deployed regardless. Fix: set `nats.enabled: false` explicitly.
+
+3. **Rocket.Chat 8.6.1 requires MongoDB ≥ 8.0; the chart pins 6.0.10.** RC exits at boot with `YOUR CURRENT MONGODB VERSION IS NOT SUPPORTED`. Fix: override `mongodb.image.tag: "8.0.13"` (same `bitnamilegacy/mongodb` repo family). If a failed first attempt already wrote a 6.0 data directory, delete the PVC and reinstall — 6.0 → 8.0 is not an in-place upgrade (it would skip 7.0).
+
+4. **No default StorageClass in the cluster → the Mongo PVC stays Pending → RC crash-loops with `Topology is closed`.** The chart's Mongo PVC sets no `storageClassName`; without a default StorageClass the PVC fails to bind (`no persistent volumes available for this claim and no storage class is set`), Mongo never starts, and RC keeps failing to create indexes against a closed connection during first boot. Fix: `mongodb.persistence.storageClass: csi-disk`. Note: StatefulSet `volumeClaimTemplates` are **immutable**, so a fix after the fact requires uninstall + delete the orphaned PVC + reinstall (safe here — RC had never started, no data).
+
+5. **`helm upgrade` without `--version` drifted kube-prometheus-stack 90.0.0 → 91.4.1 and caused 3 false alerts** (a second occurrence of the `helm upgrade` version-drift gotcha from the previous section). The newer chart's built-in rules use `absent(up{job="kube-scheduler"|"kube-proxy"|"kube-controller-manager"})`; on a managed CCE control plane those jobs have **zero scrape targets** (no pods to scrape — the chart's synthetic services have no endpoints), so `absent()` = 1 and `KubeSchedulerDown`/`KubeProxyDown`/`KubeControllerManagerDown` all fired. They carry no `app` label, so they fell through to the catch-all route and went to email. (Alertmanager showed 4 active alerts at the time — the 3 above plus the always-on `Watchdog` canary, which is unrelated to the drift.) Fix: re-upgrade pinned at `--version 90.0.0` (the `-f k8s/monitoring-values.yaml --reuse-values` kept the matcher-strategy fix); all 3 `Kube*Down` alerts cleared (`Watchdog` stays active by design).
+
+6. **Go templates in the AlertmanagerConfig: `\n` escapes are not processed — you need real newlines.** A `text` template written as `'line1\nline2'` renders the literal characters `\n` in the message. Fix: use a YAML block scalar (`text: |-`) so the template contains actual newline characters.
+
+7. **The `rocketchatConfigs` fields are strict — the CRD rejects unknown fields.** `username` is not a field (`unknown field "spec.receivers[0].rocketchatConfigs[0].username"`). Also, `apiURL` is a **plain string** (pattern `^https?://.+$`), not a SecretKeySelector — the in-cluster `http://rocketchat-rocketchat.monitoring.svc:80` goes inline (non-sensitive); only `token` and `tokenID` are SecretKeySelectors.
+
+8. **Resetting the admin password: `rc-password` hangs in the RC image.** Running `node /app/bundle/main.js rc-password <user> <pass>` inside the pod hangs indefinitely with no output. What worked: delete the admin user from Mongo directly (`db.users.deleteMany({username: "admin"})` + `db.meteor_accounts_password_login_solutions.deleteMany({})` via `mongosh` inside the mongo pod), then restart the RC pod so the `ADMIN_*` env-var bootstrap recreates the admin with the current password. (The bootstrap only runs while no admin user exists — once an admin exists, `ADMIN_PASS` is ignored, which is why the reset is needed if the secret's password changed after first boot.)
+
