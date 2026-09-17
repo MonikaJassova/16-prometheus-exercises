@@ -195,3 +195,67 @@ Instead of using Slack, a **self-hosted Rocket.Chat** was deployed to the cluste
 
 8. **Resetting the admin password: `rc-password` hangs in the RC image.** Running `node /app/bundle/main.js rc-password <user> <pass>` inside the pod hangs indefinitely with no output. What worked: delete the admin user from Mongo directly (`db.users.deleteMany({username: "admin"})` + `db.meteor_accounts_password_login_solutions.deleteMany({})` via `mongosh` inside the mongo pod), then restart the RC pod so the `ADMIN_*` env-var bootstrap recreates the admin with the current password. (The bootstrap only runs while no admin user exists — once an admin exists, `ADMIN_PASS` is ignored, which is why the reset is needed if the secret's password changed after first boot.)
 
+## Testing the Alerts
+
+All **5 alerts** were triggered end-to-end (firing **and** resolved in each channel). The two traffic-driven alerts used **non-destructive bursts** against the ingress; the three state-driven alerts used temporary scale-downs/scale-ups that auto-revert. No permanent cluster state changed; the only artifacts are the auto-resolved alert history and one orphaned PVC (see Gotcha 9).
+
+### Part 1 — traffic bursts (2026-09-16, times UTC)
+
+**Approach:** two bursts fired in parallel at t=0 (2026-09-16, times UTC):
+- **404 burst** (drives `NginxIngressHigh4xxRatio` → email): 300 requests over ~60s to a nonexistent path, with the DNS Host header (the per-status ingress metric only populates for requests matching the `java-app.local` host rule — see `k8s/ingress.yaml`).
+- **200 burst** (drives `JavaAppTooManyRequests` → chat): 3600 requests at ~20 rps over ~180s to `/get-data` — 20% headroom over the 10 req/s × 5m = 3000 request minimum, so the 5m-average rate stays above threshold through the `for: 2m`.
+
+Trigger commands: `mise exec -- bash scripts/test-alerts.sh 80.158.5.59` — the script runs a reachability pre-check on the ELB IP first (see Gotcha 4 below), then fires both bursts in parallel with the sizing described above.
+
+**Observed timeline** (alert state polled from `GET /api/v1/alerts` on Prometheus every 20s; burst start 19:08:37):
+
+| Time | Event |
+|------|-------|
+| 19:08:37 | both bursts started |
+| ~19:09:30 | `NginxIngressHigh4xxRatio` `pending` (5m rate window + threshold) |
+| ~19:11:00 | `NginxIngressHigh4xxRatio` **firing** (`for: 2m` elapsed) |
+| ~19:11:23 | `JavaAppTooManyRequests` `pending` (5m rate ~11/s still > 10; 200 burst still running to ~19:11:40) |
+| ~19:13:20 | `NginxIngressHigh4xxRatio` **resolved**; `JavaAppTooManyRequests` **firing** |
+| ~19:14:20 | `JavaAppTooManyRequests` **resolved** (rate decayed under 10/s) |
+
+**Verified end-to-end, 1 alert per channel, firing + resolved in each:**
+- **Email (Nginx/K8s route)**: `NginxIngressHigh4xxRatio` — **firing email and resolved email both received** in the Gmail inbox.
+- **Chat (Java/MySQL route)**: `JavaAppTooManyRequests` — messages in `#dev-alerts` (checked via Rocket.Chat REST API): `19:13:48` `🚨 FIRING: JavaAppTooManyRequests` (body: "Request rate is 11.5 req/s (threshold 10 req/s) over the last 5m.") and `19:18:48` `✅ RESOLVED: JavaAppTooManyRequests`.
+- Routing split held: only the Java alert in the channel, only the Nginx alert in email.
+
+### Part 2 — state-driven tests (2026-09-17, times UTC)
+
+The remaining 3 alerts were tested one by one with temporary, auto-reverting state changes. All verified end-to-end:
+
+| Test | Script | Trigger | Alert (route) | Firing | Resolved | Notification |
+|------|--------|---------|---------------|--------|----------|--------------|
+| B | `scripts/test-mysql-down.sh` | scale **both** MySQL StatefulSets to 0, hold ~7 min (5m staleness + `for: 1m` + margin), restore | `MysqlAllInstancesDown` (chat) | 08:21:38 | 08:26:38 | 🚨 FIRING + ✅ RESOLVED pair in `#dev-alerts` |
+| A | `scripts/test-ss-replicas.sh` | scale `mysql-release-primary` 1→2 (2nd pod delayed unready via temporary init container `sleep 240`), hold, scale back + remove init container + delete orphaned PVC | `StatefulSetReplicasMismatch` (email) | 09:00:47 | 09:03:48 | **firing + resolved emails received** (09:01 / 09:06) |
+| C | `scripts/test-mysql-connections.sh` | 140 parallel `mysql -e 'SELECT SLEEP(480)'` connections per instance (via one long-lived `kubectl exec` that `wait`s), self-dropping after ~8 min | `MysqlTooManyConnections` (chat) | 09:19:08 | 09:29:08 | 🚨 FIRING + ✅ RESOLVED pair in `#dev-alerts` |
+
+Each script is self-contained (trigger + wait + restore/cleanup) and prints the timestamps needed to match against the alert timeline; poll `GET /api/v1/alerts` on the Prometheus service (port 9090) while it runs.
+
+Notes:
+- **Test A first attempt failed**: scaling 1→2, the 2nd pod became Ready in ~60s — shorter than the `for: 2m`, so the mismatch only pended. Retest with a temporary init container (`sleep 240`) added to the StatefulSet template (removed after the test) kept the pod unready long enough for the alert to fire.
+- **Test C mechanics**: `SELECT SLEEP(480)` connections are killed when the `kubectl exec` stream closes, so the load must be launched from a single exec that blocks on `wait` for the whole hold. `max_connections` is 151; threshold >90% = 136, so 140 connections per instance is enough. Final `threads_connected` back to 2 (primary) / 1 (secondary). The RESOLVED *message* arrived ~5 min after the last connection dropped (09:24 → 09:29:08) — Alertmanager's default `resolve_timeout: 5m`; the alert state itself resolved immediately.
+- Final state after all tests: both MySQL StatefulSets `1/1` Ready, `mysql_up = 1` × 2, all 5 exercise alerts `inactive`, only the built-in `Watchdog` + 3 `Kube*Down` (managed control plane, ignored) active.
+
+### Gotchas
+
+1. **Rate-window alerts need a sized burst, not a quick spike.** Both exercise alerts use 5m `rate()` windows plus a `for:` clause, so a burst that ends in seconds never accumulates enough samples: the required request count is *threshold × 5 min* with headroom (3600 reqs ≈ 12 req/s avg for the 10 req/s threshold; 300 404s to keep the ratio > 5% while the 200 burst dilutes the denominator).
+
+2. **The 4xx ratio is diluted by concurrent 200s.** `NginxIngressHigh4xxRatio` divides 4xx rate by *all* request rate; firing the 200 burst at the same time raises the denominator, so the 404 burst must be sized accordingly (~300 404s → ~7.7% of ~3900 total).
+
+3. **Per-status ingress metrics only populate for DNS-host requests.** Requests hitting the ELB IP with `Host: <IP>` go through the default server and do not appear in `nginx_ingress_controller_requests{status=...}` — the 404 burst must carry `-H "Host: java-app.local"`.
+
+4. **One ELB IP was unreachable from the client.** The ingress LoadBalancer has two external IPs (`10.4.1.164` internal, `80.158.5.59` public); curl to the internal one silently returns `000`, and a full 8-minute run produced no alerts. Always verify the ingress IP is reachable (`curl -o /dev/null -w '%{http_code}'`) before starting a timing-sensitive burst.
+
+5. **The Rocket.Chat PAT in `rocketchat-auth` has only `chat.postMessage`.** Reading `#dev-alerts` history via the REST API (e.g. `channels.messages`) returns `404` with that PAT; verify chat delivery by logging in as admin (`POST /api/v1/login` with the `rocketchat-admin` secret, then `channels.list` → `channels.messages?roomId=...`) or by checking the message in the UI.
+
+6. **`count(mysql_up == 1) == 0` can never fire when ALL instances are gone.** When every MySQL pod is deleted, the `mysql_up` series no longer exists, so the query returns an **empty vector** — and PromQL produces a series only where the LHS exists, so `count(...) == 0` is never evaluated. The original rule was therefore inert in the exact scenario it was meant to catch (it would only fire if instances existed but reported `up != 1`). Fix applied in `k8s/alert-rules.yaml`: `absent(mysql_up == 1) == 1 or count(mysql_up == 1) < count(mysql_up)` — the `absent()` branch covers "all instances gone" (fires ~5 min after the last scrape, due to PromQL staleness), the `count < count` branch covers "a subset is down".
+
+7. **PromQL 5-minute staleness delays down-detection.** Deleted targets' samples stay queryable for ~5 min after the last scrape, so `absent()`-style alerts don't fire until then. In Test B the StatefulSets were scaled to 0 at 08:19 and the alert fired at 08:21:38. Budget for this when testing: hold the down state for at least ~6 min (5 min staleness + `for: 1m`).
+
+8. **`StatefulSetReplicasMismatch` needs the mismatch to persist longer than `for:` (2m).** Scaling a StatefulSet up by 1, the new pod usually becomes Ready in ~40–60s, so the mismatch (desired=2, ready=1) resolves before the `for` elapses and the alert only pends. To test it, either add a temporary init container (e.g. `sleep 240`) to the template so the new pod stays unready, or scale down 1→0 (but then `replicas=0, ready=0` → `0 != 0` is false, and only the *scale-up* window 1 vs 0 fires — that window is also short). The init-container approach is the reliable one; remove it afterwards (it rolls the existing pod once).
+
+9. **Scaling a StatefulSet up creates an orphaned PVC.** With the default `persistentVolumeClaimRetentionPolicy.whenScaled: Retain` (Bitnami MySQL chart), scaling `mysql-release-primary` 1→2 created `data-mysql-release-primary-1` (8Gi csi-disk); scaling back to 1 kept the PVC (no pod references it). It must be deleted manually (`kubectl -n default delete pvc data-mysql-release-primary-1`) or it leaks 8Gi per test.
