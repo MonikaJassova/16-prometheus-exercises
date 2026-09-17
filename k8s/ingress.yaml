@@ -5,8 +5,24 @@ metadata:
 spec:
   ingressClassName: nginx
   rules:
-    # no host -> matches every Host header, so the app is reachable
-    # directly via the ELB IP: http://<ELB-IP>/get-data
+    # DNS-hosted rule: the per-status histogram nginx_ingress_controller_requests
+    # (used by the 4xx alert) only populates for requests whose Host header
+    # matches a DNS host defined here. K8s rejects IP hosts, so a browser
+    # hitting the ELB IP (Host:<IP>) can never match a host rule.
+    - host: java-app.local
+      http:
+        paths:
+          - backend:
+              service:
+                name: java-app-service
+                port:
+                  number: 8080
+            path: /
+            pathType: Prefix
+    # hostless catch-all: keeps raw IP access working (http://<ELB-IP>/get-data
+    # -> 200). This traffic routes through the default server and does not
+    # populate the per-status metric; trigger the 4xx alert with
+    # curl -H "Host: java-app.local" http://<ELB-IP>/path-that-doesnt-exist
     - http:
         paths:
           - backend:

@@ -1,0 +1,80 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-alert-rules
+  namespace: monitoring
+  labels:
+    release: monitoring
+spec:
+  groups:
+    - name: nginx-ingress
+      rules:
+        - alert: NginxIngressHigh4xxRatio
+          expr: >
+            sum(rate(nginx_ingress_controller_requests{status=~"4.."}[5m]))
+            /
+            sum(rate(nginx_ingress_controller_requests[5m]))
+            > 0.05
+          for: 2m
+          labels:
+            severity: warning
+            app: nginx-ingress
+          annotations:
+            summary: "More than 5% of Nginx ingress requests return 4xx"
+            description: "4xx ratio over the last 5m is {{ $value | humanizePercentage }} (threshold 5%)."
+    - name: mysql
+      rules:
+        # Also fires if the mysqld-exporter is down while MySQL is up (the
+        # mysql_up series disappears -> count == 0). Accepted for this exercise.
+        - alert: MysqlAllInstancesDown
+          # Two forms of "instances down", OR-ed:
+          #  - absent(...)  : every instance is gone -> zero mysql_up series,
+          #    so count(mysql_up == 1) == 0 evaluates to an EMPTY vector and
+          #    never fires (PromQL produces series only where the LHS exists).
+          #  - count(up) < count(total) : at least one instance down while others report.
+          expr: >
+            absent(mysql_up == 1) == 1
+            or
+            count(mysql_up == 1) < count(mysql_up)
+          for: 1m
+          labels:
+            severity: critical
+            app: mysql
+          annotations:
+            summary: "One or more MySQL instances are down"
+            description: "Either all instances are gone (no mysql_up samples at all) or a subset is down — check the mysql-release-* pods."
+        - alert: MysqlTooManyConnections
+          expr: >
+            mysql_global_status_threads_connected
+            /
+            mysql_global_variables_max_connections
+            > 0.9
+          for: 2m
+          labels:
+            severity: warning
+            app: mysql
+          annotations:
+            summary: "MySQL connection count above 90% of max_connections"
+            description: "Threads connected / max_connections is {{ $value | humanizePercentage }} on {{ $labels.instance }}."
+    - name: java-app
+      rules:
+        - alert: JavaAppTooManyRequests
+          expr: sum(rate(java_app_http_requests_total[5m])) > 10
+          for: 2m
+          labels:
+            severity: warning
+            app: java-app
+          annotations:
+            summary: "Java app receives too many requests"
+            description: "Request rate is {{ $value | humanize }} req/s (threshold 10 req/s) over the last 5m."
+    - name: kubernetes
+      rules:
+        - alert: StatefulSetReplicasMismatch
+          expr: kube_statefulset_replicas != kube_statefulset_status_replicas_ready
+          for: 2m
+          labels:
+            severity: warning
+            app: kubernetes
+          annotations:
+            summary: "StatefulSet replicas mismatch"
+            description: "StatefulSet {{ $labels.namespace }}/{{ $labels.statefulset }} has fewer ready replicas than expected (ready: {{ $value }})."

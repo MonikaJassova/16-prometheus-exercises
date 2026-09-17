@@ -79,6 +79,37 @@ The application runs on port 8080 and exposes metrics on port 8081
 
 All three application metrics are collected (verified in the Prometheus targets API and via the sample queries above).
 
+## Configuring Alert Rules
+
+1. Configured alert rules for the critical issues described in the exercise — created `k8s/alert-rules.yaml` (a single `PrometheusRule` in the `monitoring` namespace, labelled `release: monitoring` so the stack's Prometheus picks it up, the same pattern as the ServiceMonitors) with 4 rule groups / 5 alerts, and applied it: `mise exec -- kubectl apply -f k8s/alert-rules.yaml`
+
+    | Alert | Expression | For | Severity |
+    |-------|-----------|-----|----------|
+    | `NginxIngressHigh4xxRatio` | `sum(rate(nginx_ingress_controller_requests{status=~"4.."}[5m])) / sum(rate(nginx_ingress_controller_requests[5m])) > 0.05` | 2m | warning |
+    | `MysqlAllInstancesDown` | `absent(mysql_up == 1) == 1 or count(mysql_up == 1) < count(mysql_up)` | 1m | critical |
+    | `MysqlTooManyConnections` | `mysql_global_status_threads_connected / mysql_global_variables_max_connections > 0.9` | 2m | warning |
+    | `JavaAppTooManyRequests` | `sum(rate(java_app_http_requests_total[5m])) > 10` | 2m | warning |
+    | `StatefulSetReplicasMismatch` | `kube_statefulset_replicas != kube_statefulset_status_replicas_ready` | 2m | warning |
+
+    Each alert carries an `app` label (`nginx-ingress` / `mysql` / `java-app` / `kubernetes`) for the notification routing in the next exercise.
+
+    Verified the rules load and are healthy:
+
+    - `mise exec -- kubectl get prometheusrule -n monitoring` → `app-alert-rules` present
+    - via `port-forward` on the Prometheus service, `curl -s http://localhost:19090/api/v1/rules` → all 5 alert names present under their 4 groups, every one `state: inactive`, `health: ok`
+    - expression sanity (each returns real data on the live cluster): `count(mysql_up == 1)` = 2 (both instances up), `mysql_global_status_threads_connected / mysql_global_variables_max_connections` = 0.033/0.007 (well under 90%), `sum(rate(java_app_http_requests_total[5m]))` = 0 req/s, `kube_statefulset_replicas != kube_statefulset_status_replicas_ready` = 0 series (all StatefulSets in sync)
+
+    The `MysqlAllInstancesDown` expression was fixed during Exercise 5 (see the alert-testing section): the original `count(mysql_up == 1) == 0` could never fire when *all* instances are gone, because then the `mysql_up` series no longer exists and the query returns an empty vector (see Gotchas 6 & 7 in that section).
+
+1. The Nginx 4xx alert depends on the per-status histogram `nginx_ingress_controller_requests`, which **only populates for requests whose `Host` header matches a DNS host defined in an Ingress** (see Gotchas 6 & 7). The original ingress was hostless (catch-all, reached via the ELB IP), so its 4xx traffic routed through the default server and never wrote the metric — the alert would stay inert. Fixed by updating `k8s/ingress.yaml` to two rules: `host: java-app.local` (measurable, drives the 4xx alert) **plus** the original hostless catch-all (keeps raw IP access working). Applied: `mise exec -- kubectl apply -f k8s/ingress.yaml`
+
+    Verified end-to-end:
+
+    - raw IP access still works: `curl -s -o /dev/null -w "%{http_code}" http://80.158.5.59/get-data` → `200`
+    - host-scoped traffic populates the metric: `curl -s -H "Host: java-app.local" http://80.158.5.59/path-that-doesnt-exist` (a 404) → `/api/v1/query` for `nginx_ingress_controller_requests{host="java-app.local"}` shows both `status="200"` and `status="404"` series
+    - the alert actually reacts: a burst of host-scoped 404s pushed the 4xx ratio to 0.5 (> 5%), and `/api/v1/alerts` showed `NginxIngressHigh4xxRatio` in `pending` state; clean host-scoped 200 traffic then diluted the ratio back to ~1.5% (< 5%) and the alert returned to `inactive`
+    - final state: all 5 alerts `state: inactive`, `health: ok`
+
 ### Gotchas
 
 1. **`helm upgrade` without `--version` resolves the chart to the latest, not the installed one.**
@@ -99,3 +130,11 @@ All three application metrics are collected (verified in the Prometheus targets 
 
 5. **The ServiceMonitor selector matches SERVICE labels, not pod labels.**
    `k8s/java-service-monitor.yaml` selects services with `app: java-app`, but the `java-app-service` Service had no `metadata.labels` — so every discovered target was silently dropped. No error anywhere: the job appears in the generated Prometheus config, targets exist in `/api/v1/targets?state=any` under `droppedTargets`, but never in `activeTargets`. Fix: add `labels: {app: java-app}` to the Service. Debugging tip: compare `state=any` vs `active` in the targets API to find silently dropped targets.
+
+6. **An Ingress `host` must be a DNS name — K8s rejects an IP.**
+   `spec.rules[].host: 80.158.5.59` fails validation: `spec.rules[0].host: Invalid value: "80.158.5.59": must be a DNS name, not an IP address`. Consequence: a browser hitting the ELB IP sends `Host: 80.158.5.59`, which can never match a host rule, so that traffic routes to the default server. Use a DNS hostname (e.g. `java-app.local`, or a real domain pointed at the ELB).
+
+7. **The per-status request histogram `nginx_ingress_controller_requests` only populates for host-matched traffic.**
+   The ingress-nginx controller exposes `nginx_ingress_controller_nginx_process_requests_total` (total, no status label) for all traffic, but the per-status histogram used by the 4xx alert (`nginx_ingress_controller_requests{status=...}`) is only written for requests whose `Host` header matches a DNS host defined in an Ingress. A hostless catch-all ingress returns 200s for everything, yet the per-status metric stays empty — the 4xx alert is defined and correct but can never fire. Fix: add a DNS host rule (e.g. `host: java-app.local`) so the measurable traffic matches it; keep the hostless catch-all alongside it to preserve raw IP access. Verify with `curl -s -H "Host: java-app.local" http://<ELB-IP>/path-that-doesnt-exist` (a 404) and then query `nginx_ingress_controller_requests{host="java-app.local"}` — both `status="200"` and `status="404"` series appear.
+
+   Note: `java-app.local` is not resolvable by any DNS — browser access to the host-scoped route only works after adding it locally (`echo "80.158.5.59 java-app.local" | sudo tee -a /etc/hosts`); without it, only `curl -H "Host: java-app.local"` works.
