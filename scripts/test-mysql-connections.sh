@@ -20,18 +20,22 @@ HOLD=480
 
 launch_load() {
   local pod=$1
+  # NOTE: must NOT be wrapped in $(...) command substitution, or the backgrounded
+  # kubectl exec runs in a subshell and its pid is not a child of this shell —
+  # the trailing `wait "$P1" "$P2"` then fails ("not a child of this shell") and
+  # set -e aborts the script before the hold/restore bookkeeping.
   kubectl -n "$NS" exec "$pod" -c mysql -- bash -c "
     for i in \$(seq 1 ${CONNS}); do
       mysql -u\"\$MYSQL_USER\" -p\"\$MYSQL_PASSWORD\" -e 'SELECT SLEEP(${HOLD})' >/dev/null 2>&1 &
     done
     wait
   " >/tmp/mysql-conn-load-${pod}.log 2>&1 &
-  echo "$!"
+  LOAD_PIDS+=("$!")
 }
 
-P1=$(launch_load mysql-release-primary-0)
-P2=$(launch_load mysql-release-secondary-0)
-echo "load launched (pids ${P1} ${P2}) at $(date -u +%H:%M:%S)"
+launch_load mysql-release-primary-0
+launch_load mysql-release-secondary-0
+echo "load launched (pids ${LOAD_PIDS[*]}) at $(date -u +%H:%M:%S)"
 
 # confirm connections landed (INFO matches a running SELECT SLEEP, COMMAND=Query)
 sleep 12
@@ -42,6 +46,6 @@ for pod in mysql-release-primary-0 mysql-release-secondary-0; do
 done
 
 echo "connections self-drop after ~${HOLD}s — poll Prometheus /api/v1/alerts"
-wait "$P1" "$P2"
+wait "${LOAD_PIDS[@]}"
 
 echo "load done at $(date -u +%H:%M:%S) — threads_connected should return to baseline"

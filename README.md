@@ -25,9 +25,13 @@ The application runs on port 8080 and exposes metrics on port 8081
    - ```bash
       helm install ingress ingress-nginx/ingress-nginx \
          -n ingress --create-namespace \
+         --version 4.15.1 \
          --wait --timeout 10m \
          -f k8s/ingress-values.yaml
-     ```
+   ```
+   (pin `--version` so a later unpinned `helm upgrade` or a fresh install never resolves to a newer chart)
+
+   Note: this must be done *after* the kube-prometheus-stack (Monitoring step 1) on a fresh cluster — `k8s/ingress-values.yaml` enables the metrics ServiceMonitor, and its CRD (`monitoring.coreos.com/v1`) only exists once the stack is installed (see Gotcha 1 in this section).
 
 1. Wrote K8s config files for the sample Java app with 3 replicas, Ingress rule, DockerHub and DB Secrets, DB ConfigMap, and deployed everything to the cluster:
    - `kubectl apply -f k8s/db-secret.yaml`
@@ -41,8 +45,14 @@ The application runs on port 8080 and exposes metrics on port 8081
    - `kubectl get deploy java-app-deployment` → `3/3 READY`, `3 UP-TO-DATE`, `3 AVAILABLE`
    - `kubectl get pods -l app=java-app` → 3 pods `1/1 Running`, 0 restarts
    - `kubectl get endpoints java-app-service` → 3 endpoint IPs (one per replica)
-   - `curl -s http://80.158.5.59/get-data` → HTTP 200 with live data from MySQL
-   - `kubectl logs -n ingress deploy/ingress-ingress-nginx-controller` → requests from the ingress load balancer across all 3 pod IPs (`172.16.0.21`, `172.16.0.39`, `172.16.0.51`)
+   - `curl -s http://<ELB-IP>/get-data` → HTTP 200 with live data from MySQL
+   - `kubectl logs -n ingress deploy/ingress-ingress-nginx-controller` → requests from the ingress load balancer across all 3 pod IPs
+
+   `<ELB-IP>` is the ingress LoadBalancer's **public** IP — read it with `mise exec -- kubectl -n ingress get svc ingress-ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[*].ip}'` (returns the public + internal IPs; use the public one). It is cluster-specific and changes on every fresh cluster (this one: `164.30.26.65`).
+
+### Gotchas
+
+1. **`helm install` fails on a fresh cluster without the Prometheus Operator CRDs.** `k8s/ingress-values.yaml` enables the metrics ServiceMonitor, so the rendered manifest references `ServiceMonitor` (`monitoring.coreos.com/v1`) — a CRD that only exists once the kube-prometheus-stack is installed. On a fresh cluster (no `monitoring` namespace yet) the install fails with `no matches for kind "ServiceMonitor"` before anything is created. Fix: install the stack first (Monitoring step 1), then run the ingress install unchanged.
 
 ## Monitoring the Applications
 
@@ -50,15 +60,14 @@ The application runs on port 8080 and exposes metrics on port 8081
 
    - added the Helm repo: `helm repo add prometheus-community https://prometheus-community.github.io/helm-charts`
    - updated the index: `helm repo update`
-   - created a separate namespace: `kubectl create ns monitoring`
-   - installed the Helm chart: `helm install monitoring prometheus-community/kube-prometheus-stack -n monitoring --wait --timeout 10m`
+   - installed the Helm chart (the separate `monitoring` namespace is created by `--create-namespace`): `helm install monitoring prometheus-community/kube-prometheus-stack -n monitoring --create-namespace --version 90.0.0 --wait --timeout 10m` — **pin the chart version**: an unpinned install resolves to the latest chart, whose built-in `absent(up{job="kube-scheduler"|"kube-proxy"|"kube-controller-manager"})` rules fire on a managed CCE control plane (no scrape targets → 3 false `Kube*Down` alerts, see the `helm upgrade` version-drift gotcha in "Sending Alert Notifications"). 90.0.0 also matches the `--version 90.0.0` used for later upgrades, so the release never drifts.
 
    Verified the deployment end-to-end:
 
    - all components are Running: `kubectl -n monitoring get pods -l "release=monitoring"` → all pods `x/x Running`, 0 restarts
    - Prometheus is serving and scraping its built-in targets: `kubectl -n monitoring port-forward svc/monitoring-kube-prometheus-prometheus 19090:9090`, then `curl -s http://localhost:19090/api/v1/targets` → all built-in targets (apiserver, kubelet, node-exporter, kube-state-metrics, ...) `up`
 
-1. For Nginx Controller monitoring, the chart ships a Prometheus metrics endpoint, but it has to be enabled - adjusted `k8s/ingress-values.yaml` (metrics enabled + ServiceMonitor labelled with `release: monitoring` so the stack's Prometheus picks it up) and applied: `helm upgrade ingress ingress-nginx/ingress-nginx -n ingress -f k8s/ingress-values.yaml --wait --timeout 10m`
+1. For Nginx Controller monitoring, the chart ships a Prometheus metrics endpoint, but it has to be enabled - adjusted `k8s/ingress-values.yaml` (metrics enabled + ServiceMonitor labelled with `release: monitoring` so the stack's Prometheus picks it up) and applied: `helm upgrade ingress ingress-nginx/ingress-nginx -n ingress --version 4.15.1 -f k8s/ingress-values.yaml --wait --timeout 10m` (version-pinned to the installed chart — an unpinned upgrade would drift to the latest chart, the same failure mode as the MySQL and stack upgrades)
 
    - verified: `kubectl -n ingress get svc ingress-ingress-nginx-controller-metrics` exists, and in Prometheus targets `curl -s http://localhost:19090/api/v1/targets` shows the `ingress-ingress-nginx-controller-metrics` job `up`
    - sample metric: `curl -s "http://localhost:19090/api/v1/query" --data-urlencode 'query=nginx_ingress_controller_nginx_process_requests_total'` returns data
@@ -105,10 +114,10 @@ All three application metrics are collected (verified in the Prometheus targets 
 
     Verified end-to-end:
 
-    - raw IP access still works: `curl -s -o /dev/null -w "%{http_code}" http://80.158.5.59/get-data` → `200`
-    - host-scoped traffic populates the metric: `curl -s -H "Host: java-app.local" http://80.158.5.59/path-that-doesnt-exist` (a 404) → `/api/v1/query` for `nginx_ingress_controller_requests{host="java-app.local"}` shows both `status="200"` and `status="404"` series
-    - the alert actually reacts: a burst of host-scoped 404s pushed the 4xx ratio to 0.5 (> 5%), and `/api/v1/alerts` showed `NginxIngressHigh4xxRatio` in `pending` state; clean host-scoped 200 traffic then diluted the ratio back to ~1.5% (< 5%) and the alert returned to `inactive`
-    - final state: all 5 alerts `state: inactive`, `health: ok`
+   - raw IP access still works: `curl -s -o /dev/null -w "%{http_code}" http://<ELB-IP>/get-data` → `200`
+   - host-scoped traffic populates the metric: `curl -s -H "Host: java-app.local" http://<ELB-IP>/path-that-doesnt-exist` (a 404) → `/api/v1/query` for `nginx_ingress_controller_requests{host="java-app.local"}` shows both `status="200"` and `status="404"` series
+   - the alert actually reacts: a burst of host-scoped 404s pushed the 4xx ratio to 0.5 (> 5%), and `/api/v1/alerts` showed `NginxIngressHigh4xxRatio` in `pending` state; clean host-scoped 200 traffic then diluted the ratio back to ~1.5% (< 5%) and the alert returned to `inactive`
+   - final state: all 5 alerts `state: inactive`, `health: ok`
 
 ### Gotchas
 
@@ -132,26 +141,62 @@ All three application metrics are collected (verified in the Prometheus targets 
    `k8s/java-service-monitor.yaml` selects services with `app: java-app`, but the `java-app-service` Service had no `metadata.labels` — so every discovered target was silently dropped. No error anywhere: the job appears in the generated Prometheus config, targets exist in `/api/v1/targets?state=any` under `droppedTargets`, but never in `activeTargets`. Fix: add `labels: {app: java-app}` to the Service. Debugging tip: compare `state=any` vs `active` in the targets API to find silently dropped targets.
 
 6. **An Ingress `host` must be a DNS name — K8s rejects an IP.**
-   `spec.rules[].host: 80.158.5.59` fails validation: `spec.rules[0].host: Invalid value: "80.158.5.59": must be a DNS name, not an IP address`. Consequence: a browser hitting the ELB IP sends `Host: 80.158.5.59`, which can never match a host rule, so that traffic routes to the default server. Use a DNS hostname (e.g. `java-app.local`, or a real domain pointed at the ELB).
+   `spec.rules[].host: <ELB-IP>` (any IP) fails validation: `spec.rules[0].host: Invalid value: "<ELB-IP>": must be a DNS name, not an IP address`. Consequence: a browser hitting the ELB IP sends `Host: <ELB-IP>`, which can never match a host rule, so that traffic routes to the default server. Use a DNS hostname (e.g. `java-app.local`, or a real domain pointed at the ELB).
 
 7. **The per-status request histogram `nginx_ingress_controller_requests` only populates for host-matched traffic.**
    The ingress-nginx controller exposes `nginx_ingress_controller_nginx_process_requests_total` (total, no status label) for all traffic, but the per-status histogram used by the 4xx alert (`nginx_ingress_controller_requests{status=...}`) is only written for requests whose `Host` header matches a DNS host defined in an Ingress. A hostless catch-all ingress returns 200s for everything, yet the per-status metric stays empty — the 4xx alert is defined and correct but can never fire. Fix: add a DNS host rule (e.g. `host: java-app.local`) so the measurable traffic matches it; keep the hostless catch-all alongside it to preserve raw IP access. Verify with `curl -s -H "Host: java-app.local" http://<ELB-IP>/path-that-doesnt-exist` (a 404) and then query `nginx_ingress_controller_requests{host="java-app.local"}` — both `status="200"` and `status="404"` series appear.
 
-   Note: `java-app.local` is not resolvable by any DNS — browser access to the host-scoped route only works after adding it locally (`echo "80.158.5.59 java-app.local" | sudo tee -a /etc/hosts`); without it, only `curl -H "Host: java-app.local"` works.
+   Note: `java-app.local` is not resolvable by any DNS — browser access to the host-scoped route only works after adding it locally (`echo "<ELB-IP> java-app.local" | sudo tee -a /etc/hosts`); without it, only `curl -H "Host: java-app.local"` works.
 
 ## Sending Alert Notifications
 
 Instead of using Slack, a **self-hosted Rocket.Chat** was deployed to the cluster and used as the chat channel (native Alertmanager `rocketchatConfigs` receiver — the deployed Alertmanager is v0.34.0, so no webhook adapter is needed). Email reuses the existing Gmail configuration from the 16-prometheus project.
 
 1. Deployed Rocket.Chat with a single Helm chart (2-pod monolith: Rocket.Chat + MongoDB):
-    - `helm repo add rocketchat https://rocketchat.github.io/helm-charts` + `helm repo update`
-    - `mise exec -- helm install rocketchat rocketchat/rocketchat -n monitoring -f k8s/rocketchat-values.yaml --set "mongodb.auth.passwords[0]=<app-pass>" --set "mongodb.auth.rootPassword=<root-pass>" --wait --timeout 15m`
-    - `k8s/rocketchat-values.yaml` — `microservices.enabled: false` **and** `nats.enabled: false` (see Gotcha 2 below), explicit resources (the chart ships none), `extraSecret: rocketchat-admin` for headless first boot (`ADMIN_USERNAME`/`ADMIN_EMAIL`/`ADMIN_PASS` env vars create the admin user and mark the setup wizard completed — the whole setup is then API-driven, no browser), `mongodb.image.tag: "8.0.13"` (RC 8.6.1 requires Mongo ≥ 8.0), `mongodb.persistence.storageClass: csi-disk`
-    - browser access is via `kubectl port-forward` (dev); Alertmanager talks to Rocket.Chat in-cluster at `http://rocketchat-rocketchat.monitoring.svc:80`
+   - `helm repo add rocketchat https://rocketchat.github.io/helm-charts` + `helm repo update`
+   - apply the headless-bootstrap secret **before** the install — `extraSecret: rocketchat-admin` in the values references it, and the RC pod will not start (envFrom secret-not-found) if it is missing. Fill `ADMIN_PASS` in `k8s/rocketchat-admin-secret.yaml` with the real password, then: `mise exec -- kubectl apply -f k8s/rocketchat-admin-secret.yaml`
+   - `mise exec -- helm install rocketchat rocketchat/rocketchat -n monitoring --version 7.0.2 -f k8s/rocketchat-values.yaml --set "mongodb.auth.passwords[0]=<app-pass>" --set "mongodb.auth.rootPassword=<root-pass>" --wait --timeout 15m` (version-pinned to the installed chart — an unpinned install/upgrade resolves to the latest chart and may change app/version behavior; RC 8.6.1 requires Mongo ≥ 8.0, see Gotcha 3)
+   - `k8s/rocketchat-values.yaml` — `microservices.enabled: false` **and** `nats.enabled: false` (see Gotcha 2 below), explicit resources (the chart ships none), `extraSecret: rocketchat-admin` for headless first boot (`ADMIN_USERNAME`/`ADMIN_EMAIL`/`ADMIN_PASS` env vars create the admin user and mark the setup wizard completed — the whole setup is then API-driven, no browser), `mongodb.image.tag: "8.0.13"` (RC 8.6.1 requires Mongo ≥ 8.0), `mongodb.persistence.storageClass: csi-disk`
+   - browser access is via `kubectl port-forward` (dev); Alertmanager talks to Rocket.Chat in-cluster at `http://rocketchat-rocketchat.monitoring.svc:80`
 
-    Verified: `mise exec -- kubectl -n monitoring get pods` → `rocketchat-rocketchat-*` 1/1 + `rocketchat-mongodb-0` 2/2, 0 restarts, **no NATS pods**; PVC `Bound` on `csi-disk`; port-forward → `/health` 200 and admin login `success`.
+   Verified: `mise exec -- kubectl -n monitoring get pods` → `rocketchat-rocketchat-*` 1/1 + `rocketchat-mongodb-0` 2/2, 0 restarts, **no NATS pods**; PVC `Bound` on `csi-disk`; port-forward → `/health` 200 and admin login `success`.
 
 1. Created the `#dev-alerts` channel and the Alertmanager credentials **via the Rocket.Chat API**: `POST /api/v1/login` → `POST /api/v1/channels.create` → `POST /api/v1/users.generatePersonalAccessToken`. The PAT + admin userId are stored in the `rocketchat-auth` Secret (keys `token`, `token_id`) — values live in the cluster only, never in the repo (`k8s/rocketchat-secret.yaml` is a placeholder). Verified with a test `POST /api/v1/chat.postMessage` using the PAT.
+
+   Exact API calls (RC 8.6.1; port-forward the service to `localhost:8888` first — `RC_URL` below):
+
+   ```bash
+   RC_URL=http://localhost:8888
+   # 1) login as the bootstrapped admin -> authToken + userId
+   RESP=$(curl -s -X POST "$RC_URL/api/v1/login" -H "Content-Type: application/json" \
+   -d '{"username":"admin","password":"<ADMIN_PASS>"}')
+   AT=$(echo "$RESP" | jq -r .data.authToken)
+   ADMIN_ID=$(echo "$RESP" | jq -r .data.userId)
+
+   # 2) create the channel (body: the channel NAME only)
+   curl -s -X POST "$RC_URL/api/v1/channels.create" \
+   -H "X-Auth-Token: $AT" -H "X-User-Id: $ADMIN_ID" -H "Content-Type: application/json" \
+   -d '{"name":"dev-alerts"}'            # -> {"channel":{"_id":"...","name":"dev-alerts"},...}
+
+   # 3) generate the PAT — body is {"tokenName": "..."} ONLY (no "scopes" — see Gotcha 9);
+   #    the token string comes back at the top level of the response
+   PAT=$(curl -s -X POST "$RC_URL/api/v1/users.generatePersonalAccessToken" \
+   -H "X-Auth-Token: $AT" -H "X-User-Id: $ADMIN_ID" -H "Content-Type: application/json" \
+   -d '{"tokenName":"alertmanager"}' | jq -r .token)
+
+   # 4) store in the cluster (kubectl create secret generic in kubectl 1.34);
+   #    round-trip the stored token back through the API before trusting it
+   kubectl -n monitoring create secret generic rocketchat-auth \
+   --from-literal="token=$PAT" --from-literal="token_id=$ADMIN_ID" --dry-run=client -o yaml | kubectl apply -f -
+   STORED=$(kubectl -n monitoring get secret rocketchat-auth -o jsonpath='{.data.token}' | base64 -d)
+
+   # 5) verify the PAT can post (body: the channel NAME, not a channelId — see Gotcha 10)
+   curl -s -X POST "$RC_URL/api/v1/chat.postMessage" \
+   -H "X-Auth-Token: $STORED" -H "X-User-Id: $ADMIN_ID" -H "Content-Type: application/json" \
+   -d '{"channel":"dev-alerts","text":"test (delete)"}'   # -> {"success":true,...}
+   ```
+
+   Cleanup of the test message: RC 8.6.1 has **no REST endpoint to delete a channel message**. It must be removed from Mongo directly — `mise exec -- kubectl -n monitoring exec rocketchat-mongodb-0 -c mongodb -- mongosh -u root -p <root-pass> --authenticationDatabase admin --quiet --eval 'db.getSiblingDB("rocketchat").rocketchat_message.deleteMany({msg:"<exact text>"})'` (or simply leave it - a harmless dev artifact).
 
 1. For email, `k8s/email-secret.yaml` committed as the placeholder manifest; adjusted with actual value and applied.
 
@@ -172,7 +217,7 @@ Instead of using Slack, a **self-hosted Rocket.Chat** was deployed to the cluste
     Verified: `kubectl -n monitoring get alertmanagerconfig` → `app-notifications`; Alertmanager logs show "Completed loading of configuration file"; `/api/v2/status` on the Alertmanager service shows both receivers and both child routes in the generated config.
 
 1. Verified end-to-end (1 alert per channel):
-    - **Email**: a burst of host-scoped 404s (`curl -H "Host: java-app.local" http://80.158.5.59/path-that-doesnt-exist`) drove `NginxIngressHigh4xxRatio` to firing → **email arrived in the Gmail inbox**; 1200 clean 200s then diluted the ratio back under 5% and the alert resolved
+    - **Email**: a burst of host-scoped 404s (`curl -H "Host: java-app.local" http://<ELB-IP>/path-that-doesnt-exist`) drove `NginxIngressHigh4xxRatio` to firing → **email arrived in the Gmail inbox**; 1200 clean 200s then diluted the ratio back under 5% and the alert resolved
     - **Chat**: a ~15 req/s load for 4 min (`/get-data`) drove `JavaAppTooManyRequests` to firing → **message appeared in `#dev-alerts`** (title `🚨 FIRING: JavaAppTooManyRequests`, body with summary + description); the load decayed and the **RESOLVED** message followed
     - routing split held: Java/MySQL alerts appear in the channel only, Nginx/K8s alerts in email only
     - final state: all 5 exercise alerts `state: inactive`, `health: ok`; only the built-in `Watchdog` active in Alertmanager
@@ -195,33 +240,43 @@ Instead of using Slack, a **self-hosted Rocket.Chat** was deployed to the cluste
 
 8. **Resetting the admin password: `rc-password` hangs in the RC image.** Running `node /app/bundle/main.js rc-password <user> <pass>` inside the pod hangs indefinitely with no output. What worked: delete the admin user from Mongo directly (`db.users.deleteMany({username: "admin"})` + `db.meteor_accounts_password_login_solutions.deleteMany({})` via `mongosh` inside the mongo pod), then restart the RC pod so the `ADMIN_*` env-var bootstrap recreates the admin with the current password. (The bootstrap only runs while no admin user exists — once an admin exists, `ADMIN_PASS` is ignored, which is why the reset is needed if the secret's password changed after first boot.)
 
+9. **RC 8.6.1 `users.generatePersonalAccessToken` rejects `scopes` — the PAT is full-privilege.** The API route validates the body strictly: sending `{"tokenName":"...","scopes":["chat.postMessage"]}` fails with `must NOT have additional properties`. Only `{"tokenName":"..."}` is accepted, so the generated PAT carries **all** permissions of the admin, not the scoped `chat.postMessage`-only token the README originally assumed. There is no way to scope a PAT via the REST API in 8.6.1. Consequence: treat the PAT as a full-privilege credential (it can do anything the admin can), and note that the `chat.postMessage`-only assumption in the old Gotcha 5 no longer applies.
+
+10. **RC 8.6.1 `chat.postMessage` requires the channel NAME, not a `channelId`.** A body of `{"channelId":"<id>","text":"..."}` is rejected (`must have required property 'roomId' / 'channel'` — it wants the name). The working body is `{"channel":"dev-alerts","text":"..."}`. Note the Alertmanager `rocketchatConfigs.channel` field uses `#dev-alerts` (with the `#`), which is the *in-app* channel identifier, distinct from the API's name-based lookup — both resolve to the same channel.
+
+11. **There is no REST endpoint to delete a *channel* message in 8.6.1.** `DELETE /api/v1/im.message` and `/api/v1/im.delete` are DM-only (`im.delete` returns `invalid-channel` for channels; it expects a `oneOf` body of `{roomId, msgId}` for DMs or `{username, ...}` for own DM messages). To remove a test message from `#dev-alerts`, delete it from Mongo: `mongosh ... --eval 'db.getSiblingDB("rocketchat").rocketchat_message.deleteMany({msg:"<text>"})'`.
+
+12. **PATs are not stored in any Mongo collection and cannot be listed/revoked via the API or DB.** The `users.generatePersonalAccessToken` response returns the token once (top-level `token` string) and it is not persisted in any queryable `rocketchat` collection (no `personal_access_tokens` collection exists; `users` has no token field). The `users.deletePersonalAccessToken` endpoint 404s in 8.6.1. Practical effect: (a) if you lose the token you must regenerate it (a new name → new token; reusing a name returns `error-token-already-exists`), and (b) orphaned tokens from repeated generation calls accumulate invisibly and cannot be cleaned up short of deleting the admin user (which also clears all its tokens). Generate exactly one, capture it into the secret immediately, and verify the *stored* value by round-tripping it through the API before trusting it (see step 2 above).
+
 ## Testing the Alerts
 
 All **5 alerts** were triggered end-to-end (firing **and** resolved in each channel). The two traffic-driven alerts used **non-destructive bursts** against the ingress; the three state-driven alerts used temporary scale-downs/scale-ups that auto-revert. No permanent cluster state changed; the only artifacts are the auto-resolved alert history and one orphaned PVC (see Gotcha 9).
 
-### Part 1 — traffic bursts (2026-09-16, times UTC)
+### Part 1 — traffic bursts (2026-09-17, times UTC)
 
-**Approach:** two bursts fired in parallel at t=0 (2026-09-16, times UTC):
-- **404 burst** (drives `NginxIngressHigh4xxRatio` → email): 300 requests over ~60s to a nonexistent path, with the DNS Host header (the per-status ingress metric only populates for requests matching the `java-app.local` host rule — see `k8s/ingress.yaml`).
-- **200 burst** (drives `JavaAppTooManyRequests` → chat): 3600 requests at ~20 rps over ~180s to `/get-data` — 20% headroom over the 10 req/s × 5m = 3000 request minimum, so the 5m-average rate stays above threshold through the `for: 2m`.
+**Approach:** two bursts fired in parallel at t=0 (2026-09-17, times UTC):
+- **404 burst** (drives `NginxIngressHigh4xxRatio` → email): ~300 requests spread over ~150s to a nonexistent path, with the DNS Host header (the per-status ingress metric only populates for requests matching the `java-app.local` host rule — see `k8s/ingress.yaml`). It **must run longer than the alert's `for: 2m`** — `nginx_ingress_controller_requests` is a counter, so `rate()` collapses to 0 the instant the burst stops (a flat counter has slope 0); a ~60s burst therefore never lets the 2m `for` elapse (see Gotcha 10).
+- **200 burst** (drives `JavaAppTooManyRequests` → chat): 3600 requests at ~20 rps over ~180s to `/get-data`, **also carrying the `Host: java-app.local` header** so it feeds the per-status denominator and dilutes the 4xx ratio (see Gotcha 2). The ~20 rps is ~20% headroom over the 10 req/s × 5m = 3000-request minimum, so the 5m-average rate stays above threshold through the `for: 2m`.
 
-Trigger commands: `mise exec -- bash scripts/test-alerts.sh 80.158.5.59` — the script runs a reachability pre-check on the ELB IP first (see Gotcha 4 below), then fires both bursts in parallel with the sizing described above.
+Trigger command: `mise exec -- bash scripts/test-alerts.sh <ELB-IP>` (pass the ingress public IP, read as described in the Deploying section) — the script runs a reachability pre-check on the ELB IP first (see Gotcha 4 below), then fires both bursts in parallel with the sizing described above.
 
-**Observed timeline** (alert state polled from `GET /api/v1/alerts` on Prometheus every 20s; burst start 19:08:37):
+**Observed timeline** (alert state polled from `GET /api/v1/rules` on Prometheus every 20s; burst start 14:36:19):
 
 | Time | Event |
 |------|-------|
-| 19:08:37 | both bursts started |
-| ~19:09:30 | `NginxIngressHigh4xxRatio` `pending` (5m rate window + threshold) |
-| ~19:11:00 | `NginxIngressHigh4xxRatio` **firing** (`for: 2m` elapsed) |
-| ~19:11:23 | `JavaAppTooManyRequests` `pending` (5m rate ~11/s still > 10; 200 burst still running to ~19:11:40) |
-| ~19:13:20 | `NginxIngressHigh4xxRatio` **resolved**; `JavaAppTooManyRequests` **firing** |
-| ~19:14:20 | `JavaAppTooManyRequests` **resolved** (rate decayed under 10/s) |
+| 14:36:19 | both bursts started |
+| ~14:37:11 | `NginxIngressHigh4xxRatio` `pending` (4xx ratio > 5% sustained; 404 burst still running to ~14:38:49) |
+| ~14:39:11 | `NginxIngressHigh4xxRatio` **firing** (`for: 2m` elapsed) |
+| ~14:39:31 | `JavaAppTooManyRequests` `pending` (5m rate still > 10) |
+| ~14:41:32 | `JavaAppTooManyRequests` **firing** (`for: 2m` elapsed) |
+| ~14:42:03 | `JavaAppTooManyRequests` **resolved** (rate decayed under 10/s) |
+| ~14:43:23 | `NginxIngressHigh4xxRatio` **resolved** (404 rate collapsed to 0 once the burst stopped, ratio diluted under 5%) |
 
 **Verified end-to-end, 1 alert per channel, firing + resolved in each:**
-- **Email (Nginx/K8s route)**: `NginxIngressHigh4xxRatio` — **firing email and resolved email both received** in the Gmail inbox.
-- **Chat (Java/MySQL route)**: `JavaAppTooManyRequests` — messages in `#dev-alerts` (checked via Rocket.Chat REST API): `19:13:48` `🚨 FIRING: JavaAppTooManyRequests` (body: "Request rate is 11.5 req/s (threshold 10 req/s) over the last 5m.") and `19:18:48` `✅ RESOLVED: JavaAppTooManyRequests`.
+- **Email (Nginx/K8s route)**: `NginxIngressHigh4xxRatio` — fired and resolved (firing + resolved emails in the Gmail inbox).
+- **Chat (Java/MySQL route)**: `JavaAppTooManyRequests` — `🚨 FIRING` + `✅ RESOLVED` pair in `#dev-alerts` (checked via the Rocket.Chat REST API — see Gotcha 5).
 - Routing split held: only the Java alert in the channel, only the Nginx alert in email.
+- **Note on the original run:** the first attempt (old `test-alerts.sh`) only fired `JavaAppTooManyRequests`; `NginxIngressHigh4xxRatio` stayed `inactive` because its 60s 404 burst was too short for the 2m `for` (see Gotcha 10). The fix (sustained 404 burst) was re-verified above.
 
 ### Part 2 — state-driven tests (2026-09-17, times UTC)
 
@@ -229,33 +284,45 @@ The remaining 3 alerts were tested one by one with temporary, auto-reverting sta
 
 | Test | Script | Trigger | Alert (route) | Firing | Resolved | Notification |
 |------|--------|---------|---------------|--------|----------|--------------|
-| B | `scripts/test-mysql-down.sh` | scale **both** MySQL StatefulSets to 0, hold ~7 min (5m staleness + `for: 1m` + margin), restore | `MysqlAllInstancesDown` (chat) | 08:21:38 | 08:26:38 | 🚨 FIRING + ✅ RESOLVED pair in `#dev-alerts` |
-| A | `scripts/test-ss-replicas.sh` | scale `mysql-release-primary` 1→2 (2nd pod delayed unready via temporary init container `sleep 240`), hold, scale back + remove init container + delete orphaned PVC | `StatefulSetReplicasMismatch` (email) | 09:00:47 | 09:03:48 | **firing + resolved emails received** (09:01 / 09:06) |
-| C | `scripts/test-mysql-connections.sh` | 140 parallel `mysql -e 'SELECT SLEEP(480)'` connections per instance (via one long-lived `kubectl exec` that `wait`s), self-dropping after ~8 min | `MysqlTooManyConnections` (chat) | 09:19:08 | 09:29:08 | 🚨 FIRING + ✅ RESOLVED pair in `#dev-alerts` |
+| B | `scripts/test-mysql-down.sh` | scale **both** MySQL StatefulSets to 0, hold ~7 min (5m staleness + `for: 1m` + margin), restore | `MysqlAllInstancesDown` (chat) | 14:50:40 | 14:57:21 | 🚨 FIRING 14:50:54 + ✅ RESOLVED 15:01:14 in `#dev-alerts` |
+| A | `scripts/test-ss-replicas.sh` | scale `mysql-release-primary` 1→2 (2nd pod delayed unready via temporary init container `sleep 240`), hold, scale back + remove init container + delete orphaned PVC | `StatefulSetReplicasMismatch` (email) | 15:04:55 | 15:08:33 | **firing + resolved emails** (Gmail) |
+| C | `scripts/test-mysql-connections.sh` | 140 `mysql -e 'SELECT SLEEP(480)'` connections per instance (one long-lived `kubectl exec` per pod that `wait`s), self-dropping after ~8 min | `MysqlTooManyConnections` (chat) | 15:11:32 | 15:17:42 | 🚨 FIRING 15:11:54 + ✅ RESOLVED 15:21:54 in `#dev-alerts` |
 
-Each script is self-contained (trigger + wait + restore/cleanup) and prints the timestamps needed to match against the alert timeline; poll `GET /api/v1/alerts` on the Prometheus service (port 9090) while it runs.
+("Firing"/"Resolved" are the **alert-state** transitions observed on Prometheus `/api/v1/rules`; the "Notification" timestamps are the chat messages in `#dev-alerts`. The RESOLVED *message* lags the state by ~Alertmanager's `resolve_timeout`.)
+
+Each script is self-contained (trigger + wait + restore/cleanup) and prints the timestamps needed to match against the alert timeline; poll `GET /api/v1/rules` on the Prometheus service (port 9090) while it runs.
 
 Notes:
 - **Test A first attempt failed**: scaling 1→2, the 2nd pod became Ready in ~60s — shorter than the `for: 2m`, so the mismatch only pended. Retest with a temporary init container (`sleep 240`) added to the StatefulSet template (removed after the test) kept the pod unready long enough for the alert to fire.
-- **Test C mechanics**: `SELECT SLEEP(480)` connections are killed when the `kubectl exec` stream closes, so the load must be launched from a single exec that blocks on `wait` for the whole hold. `max_connections` is 151; threshold >90% = 136, so 140 connections per instance is enough. Final `threads_connected` back to 2 (primary) / 1 (secondary). The RESOLVED *message* arrived ~5 min after the last connection dropped (09:24 → 09:29:08) — Alertmanager's default `resolve_timeout: 5m`; the alert state itself resolved immediately.
-- Final state after all tests: both MySQL StatefulSets `1/1` Ready, `mysql_up = 1` × 2, all 5 exercise alerts `inactive`, only the built-in `Watchdog` + 3 `Kube*Down` (managed control plane, ignored) active.
+- **Test C mechanics**: `SELECT SLEEP(480)` connections are killed when the `kubectl exec` stream closes, so the load must be launched from a single exec per pod that blocks on `wait` for the whole hold. `max_connections` is 151; threshold >90% = 136, so 140 connections on the primary is enough (only the primary's ratio crossed 0.9; the secondary sat lower). Final `threads_connected` back to baseline. **Bug fixed in `test-mysql-connections.sh`**: `launch_load` was originally called via `P1=$(launch_load …)`, which runs the backgrounded `kubectl exec` in a subshell — its pid is then "not a child of this shell", so the trailing `wait` fails and `set -e` aborts the script early (the load still runs, but the script's own hold/confirmation logic breaks). Fix: call `launch_load` directly and collect pids in an array, then `wait "${LOAD_PIDS[@]}"`.
+- Final state after all tests: both MySQL StatefulSets `1/1` Ready, `mysql_up = 1` × 2, no orphaned `…-primary-1` PVC, all 5 exercise alerts `inactive`, only the built-in `Watchdog` + 3 `Kube*Down` (managed control plane, ignored) active.
 
 ### Gotchas
 
-1. **Rate-window alerts need a sized burst, not a quick spike.** Both exercise alerts use 5m `rate()` windows plus a `for:` clause, so a burst that ends in seconds never accumulates enough samples: the required request count is *threshold × 5 min* with headroom (3600 reqs ≈ 12 req/s avg for the 10 req/s threshold; 300 404s to keep the ratio > 5% while the 200 burst dilutes the denominator).
+1. **Rate-window alerts need a *sustained* burst, not a quick spike.** Both exercise alerts use 5m `rate()` windows plus a `for:` clause, so a burst that ends quickly never accumulates enough samples: the required request count is *threshold × 5 min* with headroom (3600 reqs ≈ 12 req/s avg for the 10 req/s threshold). The 4xx alert additionally needs the 404 traffic to **persist for > 2m** (`for:`), not just sum to a count — see Gotcha 10.
 
-2. **The 4xx ratio is diluted by concurrent 200s.** `NginxIngressHigh4xxRatio` divides 4xx rate by *all* request rate; firing the 200 burst at the same time raises the denominator, so the 404 burst must be sized accordingly (~300 404s → ~7.7% of ~3900 total).
+2. **The 4xx ratio is diluted by concurrent 200s — but only *host-matched* 200s.** `NginxIngressHigh4xxRatio` divides 4xx rate by *all* per-status request rate (`nginx_ingress_controller_requests`), so only 200s that carry the `java-app.local` Host header raise the denominator. `scripts/test-alerts.sh` therefore sends the 200 burst **with** the Host header. At ~2 rps of 404s against ~20 rps of 200s the ratio holds ~9% (> 5%) for the whole burst. (If the 200 burst were hostless it would *not* feed the denominator, and the 4xx ratio would spike to ~100% — see Gotcha 3.)
 
 3. **Per-status ingress metrics only populate for DNS-host requests.** Requests hitting the ELB IP with `Host: <IP>` go through the default server and do not appear in `nginx_ingress_controller_requests{status=...}` — the 404 burst must carry `-H "Host: java-app.local"`.
 
 4. **One ELB IP was unreachable from the client.** The ingress LoadBalancer has two external IPs (`10.4.1.164` internal, `80.158.5.59` public); curl to the internal one silently returns `000`, and a full 8-minute run produced no alerts. Always verify the ingress IP is reachable (`curl -o /dev/null -w '%{http_code}'`) before starting a timing-sensitive burst.
 
-5. **The Rocket.Chat PAT in `rocketchat-auth` has only `chat.postMessage`.** Reading `#dev-alerts` history via the REST API (e.g. `channels.messages`) returns `404` with that PAT; verify chat delivery by logging in as admin (`POST /api/v1/login` with the `rocketchat-admin` secret, then `channels.list` → `channels.messages?roomId=...`) or by checking the message in the UI.
+5. **Chat delivery can be verified via the REST API with the `rocketchat-auth` PAT.** Because RC 8.6.1 generates full-privilege PATs (no `scopes` supported — see the Sending-Alerts Gotcha 9), the stored PAT can read `#dev-alerts` history: `POST /api/v1/login` (admin) → `channels.list` (find the `dev-alerts` `roomId`) → `GET /api/v1/channels.messages?roomId=<id>` (200, returns the FIRING/RESOLVED messages). No browser needed.
 
 6. **`count(mysql_up == 1) == 0` can never fire when ALL instances are gone.** When every MySQL pod is deleted, the `mysql_up` series no longer exists, so the query returns an **empty vector** — and PromQL produces a series only where the LHS exists, so `count(...) == 0` is never evaluated. The original rule was therefore inert in the exact scenario it was meant to catch (it would only fire if instances existed but reported `up != 1`). Fix applied in `k8s/alert-rules.yaml`: `absent(mysql_up == 1) == 1 or count(mysql_up == 1) < count(mysql_up)` — the `absent()` branch covers "all instances gone" (fires ~5 min after the last scrape, due to PromQL staleness), the `count < count` branch covers "a subset is down".
 
-7. **PromQL 5-minute staleness delays down-detection.** Deleted targets' samples stay queryable for ~5 min after the last scrape, so `absent()`-style alerts don't fire until then. In Test B the StatefulSets were scaled to 0 at 08:19 and the alert fired at 08:21:38. Budget for this when testing: hold the down state for at least ~6 min (5 min staleness + `for: 1m`).
+7. **PromQL 5-minute staleness delays down-detection.** Deleted targets' samples stay queryable for ~5 min after the last scrape, so `absent()`-style alerts don't fire until then. In Test B the StatefulSets were scaled to 0 at 14:48:28 and the alert fired at 14:50:40 (~2.2 min — the `absent()` branch evaluates once the last `mysql_up` sample goes stale, and `for: 1m` then elapses). Budget for this when testing: hold the down state for at least ~6 min (5 min staleness + `for: 1m` + margin).
 
 8. **`StatefulSetReplicasMismatch` needs the mismatch to persist longer than `for:` (2m).** Scaling a StatefulSet up by 1, the new pod usually becomes Ready in ~40–60s, so the mismatch (desired=2, ready=1) resolves before the `for` elapses and the alert only pends. To test it, either add a temporary init container (e.g. `sleep 240`) to the template so the new pod stays unready, or scale down 1→0 (but then `replicas=0, ready=0` → `0 != 0` is false, and only the *scale-up* window 1 vs 0 fires — that window is also short). The init-container approach is the reliable one; remove it afterwards (it rolls the existing pod once).
 
 9. **Scaling a StatefulSet up creates an orphaned PVC.** With the default `persistentVolumeClaimRetentionPolicy.whenScaled: Retain` (Bitnami MySQL chart), scaling `mysql-release-primary` 1→2 created `data-mysql-release-primary-1` (8Gi csi-disk); scaling back to 1 kept the PVC (no pod references it). It must be deleted manually (`kubectl -n default delete pvc data-mysql-release-primary-1`) or it leaks 8Gi per test.
+
+10. **The 4xx ratio is a `rate()` of a *counter* — it collapses to 0 the moment the 404 burst stops.** `nginx_ingress_controller_requests` is a counter, so `rate()` is non-zero only while the counter is still increasing. A ~60s burst of 404s makes the ratio > 5% for ~60s, but the alert's `for: 2m` then never elapses (the ratio drops to 0 / `NaN` within seconds of the burst ending, so the alert only pends and never fires). Fix: the 404 burst must be **sustained for longer than `for:` + rate-window warm-up** (~150s in `scripts/test-alerts.sh`, ~2 rps of host-matched 404s held for the whole window). The original script's 60s burst was the bug that kept `NginxIngressHigh4xxRatio` inert in Part 1.
+
+## Tearing Down
+
+1. **Cluster + TCP resources** (Terraform in the sibling `12-terraform-exercises` repo — removes the CCE cluster, ELB, EIP, and any Everest CSI volumes):
+   ```
+   mise exec -- terraform -chdir=environments/prometheus destroy --auto-approve
+   ```
+1. **Verify** — `mise exec -- terraform -chdir=environments/prometheus state list` returns no resources.
