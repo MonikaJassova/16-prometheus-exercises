@@ -28,7 +28,7 @@ The application runs on port 8080 and exposes metrics on port 8081
          --version 4.15.1 \
          --wait --timeout 10m \
          -f k8s/ingress-values.yaml
-   ```
+     ```
    (pin `--version` so a later unpinned `helm upgrade` or a fresh install never resolves to a newer chart)
 
    Note: this must be done *after* the kube-prometheus-stack (Monitoring step 1) on a fresh cluster — `k8s/ingress-values.yaml` enables the metrics ServiceMonitor, and its CRD (`monitoring.coreos.com/v1`) only exists once the stack is installed (see Gotcha 1 in this section).
